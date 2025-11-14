@@ -3,11 +3,20 @@
 #include <torch/extension.h>
 #include <torch/csrc/PyInterpreter.h>
 #include <ATen/OpaqueTensorImpl.h>
+#include <iostream>
+#include <cstdlib>
+
+// Logging helper (outside namespace)
+static bool get_debug_logs() {
+  static bool debug = std::getenv("TORCH_DEBUG") != nullptr;
+  return debug;
+}
+
+#define LOG_DEBUG(msg) if (get_debug_logs()) std::cerr << "[wrapped_tensor] " << msg << std::endl
 
 // register guard
 namespace at {
 namespace detail {
-//C10_REGISTER_GUARD_IMPL(PrivateUse1, c10::impl::NoOpDeviceGuardImpl<DeviceType::PrivateUse1>);
 // NOTE: pytorch's no-op class throws error on backwards with events/streams
 // TODO: why are there events in autograd?
 struct CustomNoOpDeviceGuardImpl : public c10::impl::DeviceGuardImplInterface
@@ -83,24 +92,6 @@ struct CustomNoOpDeviceGuardImpl : public c10::impl::DeviceGuardImplInterface
 };
 C10_REGISTER_GUARD_IMPL(PrivateUse1, CustomNoOpDeviceGuardImpl);
 }
-
-template <typename OpaqueHandle>
-struct TinyOpaqueTensorImpl : public OpaqueTensorImpl<OpaqueHandle> {
-  TinyOpaqueTensorImpl(
-      at::DispatchKeySet key_set,
-      const caffe2::TypeMeta data_type,
-      c10::Device device,
-      OpaqueHandle opaque_handle,
-      c10::IntArrayRef sizes,
-      c10::IntArrayRef strides,
-      int64_t storage_offset)
-      : OpaqueTensorImpl<OpaqueHandle>(key_set, data_type, device, opaque_handle, sizes) {
-    this->sizes_and_strides_.set_strides(strides);
-    this->storage_offset_ = storage_offset;
-    this->refresh_numel();
-    this->refresh_contiguous();
-  }
-};
 }
 
 struct OpenRegHooksInterface : public at::PrivateUse1HooksInterface {
@@ -109,46 +100,65 @@ struct OpenRegHooksInterface : public at::PrivateUse1HooksInterface {
 };
 
 int register_hook() {
+  LOG_DEBUG("register_hook() called");
   at::RegisterPrivateUse1HooksInterface(new OpenRegHooksInterface());
+  LOG_DEBUG("register_hook() SUCCESS - PrivateUse1 hooks registered");
   return 0;
 }
 int temp_register_hook = register_hook();
 
 at::Tensor wrap_tensor(py::object &py_obj, c10::ScalarType dtype, c10::DeviceIndex device_index) {
-  std::vector<int64_t> sizes = py_obj.attr("shape").cast<std::vector<int64_t>>();
-  std::vector<int64_t> strides;
-  int64_t storage_offset = 0;
+  LOG_DEBUG("wrap_tensor() called with dtype=" << (int)dtype << ", device=" << device_index);
   
-  if (py::hasattr(py_obj, "_torch_strides") && py::hasattr(py_obj, "_torch_offset")) {
-    strides = py_obj.attr("_torch_strides").cast<std::vector<int64_t>>();
-    storage_offset = py_obj.attr("_torch_offset").cast<int64_t>();
-  } else {
-    strides.resize(sizes.size());
-    int64_t stride = 1;
-    for (int i = sizes.size() - 1; i >= 0; i--) {
-        strides[i] = stride;
-        if (sizes[i] > 1) {
-            stride *= sizes[i];
-        }
+  std::vector<int64_t> sizes = py_obj.attr("shape").cast<std::vector<int64_t>>();
+  
+  LOG_DEBUG("  sizes: [" << (sizes.empty() ? std::string("") : std::to_string(sizes[0])) << "]");
+  
+  // Compute default strides (C-contiguous layout)
+  std::vector<int64_t> strides(sizes.size());
+  int64_t stride = 1;
+  for (int i = sizes.size() - 1; i >= 0; i--) {
+    strides[i] = stride;
+    if (sizes[i] > 1) {
+      stride *= sizes[i];
     }
   }
+  LOG_DEBUG("  computed strides");
 
-  return at::detail::make_tensor<at::TinyOpaqueTensorImpl<std::shared_ptr<c10::SafePyObject>>>(
+  auto result = at::detail::make_tensor<at::OpaqueTensorImpl<std::shared_ptr<c10::SafePyObject>>>(
     at::DispatchKeySet(at::DispatchKey::PrivateUse1),
     c10::scalarTypeToTypeMeta(dtype),
     at::Device(at::kPrivateUse1, device_index),
     std::make_shared<c10::SafePyObject>(py_obj.release().ptr(), getPyInterpreter()),
-    sizes, strides, storage_offset);
+    sizes);
+  
+  // Set strides using set_sizes_and_strides
+  auto* impl = result.unsafeGetTensorImpl();
+  impl->set_sizes_and_strides(sizes, strides);
+  
+  LOG_DEBUG("  wrap_tensor() SUCCESS - created opaque tensor");
+  return result;
 }
 
 py::object unwrap_tensor(const at::Tensor &tensor) {
+  LOG_DEBUG("unwrap_tensor() called");
+  
   auto* impl = tensor.unsafeGetTensorImpl();
-  auto* opaque_impl = static_cast<at::TinyOpaqueTensorImpl<std::shared_ptr<c10::SafePyObject>>*>(impl);
+  LOG_DEBUG("  got tensor impl");
+  
+  auto* opaque_impl = static_cast<at::OpaqueTensorImpl<std::shared_ptr<c10::SafePyObject>>*>(impl);
   std::shared_ptr<c10::SafePyObject> tiny = opaque_impl->opaque_handle();
-  return py::reinterpret_borrow<py::object>(tiny->ptr(getPyInterpreter()));
+  
+  LOG_DEBUG("  extracted opaque handle");
+  
+  auto result = py::reinterpret_borrow<py::object>(tiny->ptr(getPyInterpreter()));
+  LOG_DEBUG("  unwrap_tensor() SUCCESS - converted to Python object");
+  return result;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  LOG_DEBUG("PYBIND11_MODULE initialized");
   m.def("wrap", &wrap_tensor);
   m.def("unwrap", &unwrap_tensor);
+  LOG_DEBUG("Python module functions registered: wrap, unwrap");
 }

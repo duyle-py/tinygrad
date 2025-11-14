@@ -36,9 +36,19 @@ aten = torch.ops.aten
 # wrap view operations - Tensor's UOp graph already handles view tracking
 def wrap_view_op(fn):
   def _wrap(*args,**kwargs):
+    if TORCH_DEBUG >= 1:
+      try:
+        print(f"[wrap_view_op ENTRY] {fn.__name__} args={[type(x).__name__ for x in args]} kwargs_keys={list(kwargs.keys())}")
+      except Exception as _e:
+        print(f"[wrap_view_op ENTRY] (printing error: {_e})")
     args = [unwrap(x) if isinstance(x, torch.Tensor) else x for x in args]
     kwargs = {k:unwrap(v) if isinstance(v, torch.Tensor) else v for k,v in kwargs.items()}
     ret = fn(*args,**kwargs)
+    if TORCH_DEBUG >= 2:
+      try:
+        print(f"[wrap_view_op OUTPUT] {fn.__name__} -> type={type(ret).__name__} shape={getattr(ret,'shape',None)}")
+      except Exception as _e:
+        print(f"[wrap_view_op OUTPUT] (printing error: {_e})")
     return wrap(ret)
   return _wrap
 
@@ -55,7 +65,6 @@ view_ops = {
   "aten.unsqueeze": Tensor.unsqueeze,
   "aten.detach": Tensor.detach,
   "aten.select.int": lambda self, dim, idx: self[(slice(None),) * (dim%self.ndim) + (idx,)],
-  "aten.diagonal": Tensor.diagonal,
 }
 
 for k,v in view_ops.items(): torch.library.impl(k.replace("aten.", "aten::"), "privateuseone")(wrap_view_op(v))
@@ -152,21 +161,27 @@ def _local_scalar_dense(tensor): return unwrap(tensor).item()
 @torch.library.impl("aten::as_strided", "privateuseone")
 def as_strided(tensor:torch.Tensor, size, stride, storage_offset=None):
   storage_offset = storage_offset or 0
-  if TORCH_DEBUG >= 1: print(f"**** as_strided {tensor.shape=} {size=} {stride=} {storage_offset=}")
-  tiny_tensor = unwrap(tensor)
+  if TORCH_DEBUG: print(f"**** as_strided tensor.shape={getattr(tensor,'shape',None)} size={tuple(size)} stride={tuple(stride)} storage_offset={storage_offset}")
+  tt = unwrap(tensor)
   size, stride = tuple(size), tuple(stride)
-  if hasattr(tiny_tensor, '_strided_base'):
-    base, base_size = tiny_tensor._strided_base, tiny_tensor._base_size
+  base, base_size = (tt._strided_base, tt._base_size) if hasattr(tt, '_strided_base') else (tt.contiguous(), prod(tt.shape))
+  flat = base.reshape(base_size)
+
+  # contiguous fast-path
+  acc, contig = 1, [0]*len(size)
+  for i in range(len(size)-1, -1, -1): contig[i], acc = acc, acc*max(size[i], 1)
+  n = prod(size)
+  if stride == tuple(contig) and 0 <= storage_offset and storage_offset + n <= base_size and n > 0:
+    res = flat[storage_offset:storage_offset+n].reshape(size)
   else:
-    base = tiny_tensor.contiguous()
-    base_size = prod(base.shape)
-  flat_base = base.reshape(base_size)
-  flat_idx = sum((Tensor.arange(sz, device=base.device).reshape([sz if i==j else 1 for j in range(len(size))]) * st
-                  for i, (sz, st) in enumerate(zip(size, stride))), storage_offset)
-  result = flat_base[flat_idx.cast(dtypes.int).flatten()].reshape(size)
-  result._strided_base, result._base_size = base, base_size
-  result._torch_strides, result._torch_offset = stride, storage_offset
-  return wrap(result)
+    terms = [Tensor.arange(sz, device=base.device).reshape([sz if i==j else 1 for j in range(len(size))]) * st
+             for i, (sz, st) in enumerate(zip(size, stride)) if sz > 1 and st != 0]
+    idx = (functools.reduce(operator.add, terms) + storage_offset) if terms else Tensor.full(size, storage_offset, device=base.device, dtype=dtypes.int32)
+    res = flat[idx.cast(dtypes.int).flatten()].reshape(size)
+
+  res._strided_base, res._base_size, res._torch_strides, res._torch_offset = base, base_size, stride, storage_offset
+  if TORCH_DEBUG: print(f"**** as_strided result.shape={res.shape}")
+  return wrap(res)
 
 @torch.library.impl("aten::_reshape_alias", "privateuseone")
 def _reshape_alias(tensor:torch.Tensor, size, stride):
@@ -310,6 +325,11 @@ def scatter_add(self, dim, index, src, out):
 
 @torch.library.impl("aten::_copy_from", "privateuseone")
 def _copy_from(src: torch.Tensor, dest, non_blocking=False):
+  if TORCH_DEBUG >= 1:
+    try:
+      print(f"[_copy_from ENTRY] src(dev={src.device}, tiny={getattr(src,'is_tiny',False)}, shape={tuple(src.shape) if hasattr(src,'shape') else None}, dtype={src.dtype}) -> dest(dev={dest.device}, tiny={getattr(dest,'is_tiny',False)}, shape={tuple(dest.shape) if hasattr(dest,'shape') else None}, dtype={dest.dtype})")
+    except Exception as _e:
+      print(f"[_copy_from ENTRY] (printing error: {_e})")
   tiny_dest = unwrap(dest) if dest.is_tiny else None
   if tiny_dest is not None: tiny_dest.realize()
   cast_dtype = _from_torch_dtype(dest.dtype)
@@ -317,16 +337,25 @@ def _copy_from(src: torch.Tensor, dest, non_blocking=False):
     to_device = _from_torch_device(dest.device)
     tiny_src = unwrap(src)
     # TODO we need to properly match dest shape and strides, not blindly assign
-    if tiny_dest.uop.is_contiguous() or tiny_dest.uop.is_realized: tiny_src = tiny_src.contiguous() # this only solves some cases
+    if TORCH_DEBUG >= 2:
+      try:
+        print(f"[_copy_from] tiny->tiny dest contiguous={tiny_dest.uop.is_contiguous()} realized={tiny_dest.uop.is_realized} src shape={tiny_src.shape} dest shape={tiny_dest.shape}")
+      except Exception as _e:
+        print(f"[_copy_from] tiny->tiny debug error: {_e}")
+    if tiny_dest.uop.is_contiguous() or tiny_dest.uop.is_realized: tiny_src = tiny_src.contiguous()  # this only solves some cases
     tiny_dest.assign(tiny_src.cast(cast_dtype).to(to_device))
     Tensor.realize(tiny_dest)
   elif src.is_tiny and dest.is_cpu:
     # TODO: is there a better way?
+    if TORCH_DEBUG >= 2:
+      print(f"[_copy_from] tiny->cpu: resizing/copying src shape={tuple(src.shape)} -> dest")
     dest.resize_(src.numel()).resize_(src.shape)
     dest.copy_(torch.from_numpy(unwrap(src).cast(cast_dtype).numpy()))
   elif src.is_cpu and dest.is_tiny:
     to_device = _from_torch_device(dest.device)
     # TODO we need to properly match dest shape and strides, not blindly assign
+    if TORCH_DEBUG >= 2:
+      print(f"[_copy_from] cpu->tiny: assigning numpy to dest shape={tuple(dest.shape)} device={dest.device}")
     tiny_dest.assign(Tensor(src.numpy()).cast(cast_dtype).to(to_device))
     Tensor.realize(tiny_dest)
   else:
@@ -421,7 +450,6 @@ decomps = [
   # this needs copy_strided
   #aten.lerp,
   aten.norm,
-  aten.diag,
 ]
 for k,v in get_decompositions(decomps).items():
   key = str(k._schema).split("(")[0]
@@ -588,22 +616,66 @@ tiny_backend = {**{k:wrap_out(v) for k,v in tiny_backend_out.items()}, **{
                                         "device": _from_torch_device(device) if device else None}.items() if v is not None}),
   "aten.max.dim": lambda self, dim, keepdim=False: (self.max(dim, keepdim), self.argmax(dim, keepdim).cast(dtype=dtypes.int64)),
   "aten.unfold": Tensor.unfold,
+  # direct mappings to tinygrad Tensor methods (no custom wrappers)
+  "aten.diag": Tensor.diag,
+  "aten.diagonal": Tensor.diagonal,
 }}
 
-def wrap_fxn(k,f):
+def wrap_fxn(k, f):
   def nf(*args, **kwargs):
-    if TORCH_DEBUG:
-      print(k, len(args), [x.shape if isinstance(x, torch.Tensor) else x for x in args],
-                          {k:v.shape if isinstance(v, torch.Tensor) else v for k,v in kwargs.items()})
-    args = [unwrap(x) if isinstance(x, torch.Tensor) else x for x in args]
-    kwargs = {k:unwrap(v) if isinstance(v, torch.Tensor) else v for k,v in kwargs.items()}
-    out = f(*args, **kwargs)
-    if isinstance(out, Tensor): return wrap(out)
-    elif isinstance(out, tuple): return tuple(wrap(x) for x in out)
-    else: raise RuntimeError(f"unknown output type {type(out)}")
-  return nf
+    if TORCH_DEBUG >= 1:
+      print(f"[wrap_fxn ENTRY] {k}")
+      print(f"  args count: {len(args)}")
+      print(f"  args types: {[type(x).__name__ for x in args]}")
+      print(f"  args shapes: {[x.shape if isinstance(x, torch.Tensor) else x for x in args]}")
+      print(f"  kwargs: {dict((k,v.shape if isinstance(v, torch.Tensor) else v) for k,v in kwargs.items())}")
 
-for k,v in tiny_backend.items(): torch.library.impl(k.replace("aten.", "aten::"), "privateuseone")(wrap_fxn(k,v))
+    try:
+      args_unwrapped = [unwrap(x) if isinstance(x, torch.Tensor) else x for x in args]
+      kwargs_unwrapped = {k: unwrap(v) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
+      if TORCH_DEBUG >= 2:
+        print(f"[wrap_fxn UNWRAPPED] {k}")
+        print(f"  unwrapped args types: {[type(x).__name__ for x in args_unwrapped]}")
+      out = f(*args_unwrapped, **kwargs_unwrapped)
+      if TORCH_DEBUG >= 2:
+        print(f"[wrap_fxn OUTPUT] {k}")
+        print(f"  output type: {type(out).__name__}")
+        if isinstance(out, Tensor):
+          print(f"  output shape: {out.shape}")
+      if isinstance(out, Tensor):
+        # Do not force-set requires_grad here; let PyTorch autograd handle it.
+        result = wrap(out)
+        if TORCH_DEBUG >= 1:
+          rg = getattr(result, 'requires_grad', 'N/A')
+          print(f"[wrap_fxn SUCCESS] {k} -> wrapped Tensor (requires_grad={rg})")
+        return result
+      elif isinstance(out, tuple):
+        result = tuple(wrap(x) for x in out)
+        if TORCH_DEBUG >= 1:
+          print(f"[wrap_fxn SUCCESS] {k} -> tuple of {len(result)} elements")
+        return result
+      else:
+        raise RuntimeError(f"unknown output type {type(out)}")
+    except Exception as e:
+      print(f"[wrap_fxn ERROR] {k}: {type(e).__name__}: {e}")
+      raise
+  return nf
+print("Registering tinygrad backend functions...")
+for k,v in tiny_backend.items():
+  try:
+    if TORCH_DEBUG >= 1: print(f"[REGISTER] Attempting to register {k}")
+    wrapped_fn = wrap_fxn(k, v)
+    torch.library.impl(k.replace("aten.", "aten::"), "privateuseone")(wrapped_fn)
+    if TORCH_DEBUG >= 1: print(f"[REGISTER SUCCESS] {k}")
+  except Exception as e:
+    print(f"✗ failed to register {k}: {type(e).__name__}: {e}")
+
+# Special handling for diag operation
+# Tinygrad's Tensor.diag() decomposes into autograd-supporting ops.
+# wrap_fxn now preserves requires_grad, so this will work automatically!
+print("Registering autograd-compatible kernels...")
+
+torch.library.register_autograd("aten::diag", lambda ctx, grad_out: wrap(unwrap(grad_out).diagonal()))
 
 @torch.library.impl("aten::equal", "privateuseone")
 def equal(x: torch.Tensor, y: torch.Tensor): return (x==y).all().item()
@@ -612,8 +684,16 @@ if TORCH_DEBUG:
   from torch.utils._python_dispatch import TorchDispatchMode
   class DispatchLog(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-      #print(f"Dispatch Log: {func}(*{args}, **{kwargs})")
-      print(f"Dispatch Log: {func}")
+      try:
+        def _fmt(t):
+          if isinstance(t, torch.Tensor):
+            dev = getattr(t, 'device', None)
+            return f"Tensor(shape={tuple(t.shape)}, dtype={t.dtype}, dev={dev}, tiny={getattr(t,'is_tiny',False)})"
+          return type(t).__name__
+        arg_s = ", ".join(_fmt(a) for a in args)
+        print(f"[Dispatch] {func}: args=[{arg_s}] kwargs={list((kwargs or {}).keys())}")
+      except Exception as _e:
+        print(f"[Dispatch] {func} (printing error: {_e})")
       return func(*args, **(kwargs or {}))
   (_dispatch_log:=DispatchLog()).__enter__() # NOTE: must be kept alive
 
